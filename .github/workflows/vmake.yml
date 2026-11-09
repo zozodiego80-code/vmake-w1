@@ -1,0 +1,94 @@
+name: vmake-worker
+
+# run-name : SANS cette ligne, GitHub nomme TOUS les runs « vmake-chunk » (le type
+# de l'evenement). Le script local, lui, cherche « vmake-<job_id> » pour retrouver
+# SON run parmi les autres. Sans run-name, find_run ne trouve jamais rien : les jobs
+# tournent, mais le script attend puis abandonne en « timeout ».
+# Verifie le 16/10/2026 : display_title valait 'vmake-chunk' au lieu de 'vmake-PLUMBING-TEST'.
+run-name: vmake-${{ github.event.client_payload.job_id }}
+
+# Ce workflow ne se déclenche QUE par appel direct du script local (repository_dispatch).
+# Il ne contient aucun média : les morceaux arrivent par une Release, les résultats
+# repartent en artifact. Aucun `git push`, donc aucun conflit possible.
+
+on:
+  repository_dispatch:
+    types: [vmake-chunk]
+
+permissions:
+  contents: read
+
+jobs:
+  chunk:
+    name: vmake-${{ github.event.client_payload.job_id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Identification du job
+        run: |
+          echo "Job        : ${{ github.event.client_payload.job_id }}"
+          echo "Morceaux   : ${{ github.event.client_payload.chunk_idxs }}"
+          echo "Runner IP  : $(curl -s https://api.ipify.org)"
+
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Installer ffmpeg
+        # Sans ffmpeg, le script sort immediatement : « ffmpeg est introuvable
+        # dans le PATH » -> job en echec, aucun morceau traite.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -1
+
+      - name: Télécharger les morceaux depuis la Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p incoming
+          gh release download "${{ github.event.client_payload.release_tag }}" \
+            --pattern "chunks-*.zip" --dir incoming
+          cd incoming
+          unzip -o chunks-*.zip -d chunks
+          rm -f chunks-*.zip
+          echo "Morceaux reçus :"
+          ls -la chunks
+
+      - name: Traiter les morceaux
+        # join(...) est OBLIGATOIRE : chunk_idxs est une liste, et une liste
+        # interpolee telle quelle dans une commande shell devient le texte
+        # « Array » (constate le 16/10/2026). join() la transforme en "0,1".
+        run: |
+          python vmake_script.py --mode action \
+            --job "${{ github.event.client_payload.job_id }}" \
+            --incoming incoming/chunks \
+            --indices "${{ join(github.event.client_payload.chunk_idxs, ',') }}" \
+            --chunks-per-gid "${{ github.event.client_payload.chunks_per_gid }}" \
+            --out out
+
+      - name: Publier les résultats
+        # `always()` : si un morceau échoue, on veut quand même remonter le
+        # manifeste pour que le script local sache lequel replacer ailleurs.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmake-result-${{ github.event.client_payload.job_id }}
+          path: out/
+          # 1 jour : le script récupère les résultats dans la minute qui suit
+          # la fin du job. Le stockage d'artifacts n'est PAS gratuit en public
+          # (500 Mo sur tout le compte) : garder 7 jours ferait saturer le
+          # quota, alors que 1 jour suffit largement.
+          retention-days: 1
+          if-no-files-found: warn
